@@ -1,5 +1,3 @@
-import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import pandas as pd
 from torch.utils.data import DataLoader
