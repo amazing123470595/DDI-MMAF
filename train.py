@@ -1,131 +1,126 @@
-import torch
 import os
-import numpy as np
-from tqdm import tqdm
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import argparse
+import torch
+import pandas as pd
+from PIL import Image
 from transformers import AutoTokenizer
-from sklearn.metrics import (
-    f1_score, recall_score, precision_score, 
-    roc_auc_score, matthews_corrcoef, balanced_accuracy_score
-)
 
-def save_model(model, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(model.state_dict(), path)
+# 直接复用你 dataloader 中的图像预处理
+from dataloader import default_transform
+from model import MutiModelAF
+import config
 
-def evaluate(model, dataloader, device, criterion, tokenizer, cell_to_text_dict):
-    model.eval()
-    val_labels, val_preds, val_probs = [], [], []
-    val_running_loss = 0.0
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Draw
+except ImportError:
+    print("Warning: RDKit is not installed. SMILES to image generation will fail.")
 
-    with torch.no_grad():
-        for images, cell_names, labels in dataloader:
-            images, labels = images.to(device), labels.to(device)
-            
-            texts = [f"{name} is a {cell_to_text_dict.get(name, 'unknown')} cancer cell line." for name in cell_names]
-            inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True, max_length=64).to(device)
-
-            outputs = model(images, inputs)
-            loss = criterion(outputs, labels)
-            val_running_loss += loss.item()
-
-            probs = torch.softmax(outputs, dim=1)[:, 1]
-            _, predicted = torch.max(outputs.data, 1)
-
-            val_labels.extend(labels.cpu().numpy())
-            val_preds.extend(predicted.cpu().numpy())
-            val_probs.extend(probs.cpu().numpy())
-
-    val_metrics = {
-        'val_loss': val_running_loss / len(dataloader),
-        'precision': precision_score(val_labels, val_preds, zero_division=0),
-        'recall': recall_score(val_labels, val_preds, zero_division=0),
-        'f1': f1_score(val_labels, val_preds, zero_division=0),
-        'balanced_acc': balanced_accuracy_score(val_labels, val_preds),
-        'mcc': matthews_corrcoef(val_labels, val_preds),
-        'roc_auc': roc_auc_score(val_labels, val_probs)
-    }
-    return val_metrics
-
-def train_model(model, train_loader, test_loader, device, criterion, optimizer, 
-                tokenizer_name, cell_to_text_dict, num_epochs=100):
+def parse_args():
+    parser = argparse.ArgumentParser(description="DDI-MMAF Synergy Prediction")
+    parser.add_argument("--smiles1", type=str, required=True, help="SMILES sequence of drug 1")
+    parser.add_argument("--smiles2", type=str, required=True, help="SMILES sequence of drug 2")
+    parser.add_argument("--cell_line", type=str, required=True, help="Cancer cell line name (e.g., A2780)")
+    parser.add_argument("--tissue", type=str, default=None, help="Tissue origin. If not provided, it will be looked up.")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained .pth model file")
     
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    best_bal_acc = 0.0
-    early_stop = 0
-    patience = 20
+    # 模型解绑选项保留
+    parser.add_argument("--unbind_weights", action="store_true", help="Unbind strict state_dict matching (sets strict=False).")
+    parser.add_argument("--cpu_only", action="store_true", help="Unbind from GPU and force CPU inference.")
+    
+    return parser.parse_args()
 
-    best_metrics = {
-        "epoch": 0,
-        "balanced_acc": 0.0,
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1": 0.0,
-        "roc_auc": 0.0,
-        "mcc": 0.0
-    }
-
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
+def generate_composite_image(smiles1, smiles2, transform):
+    """
+    生成 224x448 的拼接图像，并应用 default_transform
+    """
+    mol1 = Chem.MolFromSmiles(smiles1)
+    mol2 = Chem.MolFromSmiles(smiles2)
+    
+    if mol1 is None or mol2 is None:
+        raise ValueError("Invalid SMILES sequence provided. Please check RDKit parsing.")
         
-        with tqdm(train_loader, unit="batch") as tepoch:
-            for images, cell_names, labels in tepoch:
-                tepoch.set_description(f"Epoch {epoch + 1}/{num_epochs}")
-                images, labels = images.to(device), labels.to(device)
-
-                texts = [f"{name} is a {cell_to_text_dict.get(name, 'unknown')} cancer cell line." for name in cell_names]
-                inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True, max_length=64).to(device)
-
-                optimizer.zero_grad()
-                outputs = model(images, inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-
-                running_loss += loss.item()
-                tepoch.set_postfix(loss=running_loss / len(train_loader))
-
-        train_loss = running_loss / len(train_loader)
-
-        val_metrics = evaluate(model, test_loader, device, criterion, tokenizer, cell_to_text_dict)
-
-
-        print(f"Epoch: {epoch + 1} | "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_metrics['val_loss']:.4f} | "
-              f"Balanced Acc: {val_metrics['balanced_acc']:.4f} | "
-              f"Precision: {val_metrics['precision']:.4f} | "
-              f"Recall: {val_metrics['recall']:.4f} | "
-              f"F1: {val_metrics['f1']:.4f} | "
-              f"ROC AUC: {val_metrics['roc_auc']:.4f} | "
-              f"MCC: {val_metrics['mcc']:.4f}")
-
-        if val_metrics['balanced_acc'] > best_bal_acc:
-            best_bal_acc = val_metrics['balanced_acc']
-            save_model(model, 'checkpoints/best_model.pth')
-            print(f"Best model saved! (Balanced Accuracy: {best_bal_acc:.4f})")
-
-            best_metrics.update({
-                "epoch": epoch + 1,
-                "balanced_acc": val_metrics['balanced_acc'],
-                "precision": val_metrics['precision'],
-                "recall": val_metrics['recall'],
-                "f1": val_metrics['f1'],
-                "roc_auc": val_metrics['roc_auc'],
-                "mcc": val_metrics['mcc']
-            })
-            early_stop = 0
-        else:
-            early_stop += 1
-
-        if early_stop > patience:
-            print(f"Early stopping triggered after {patience} epochs without improvement.")
-            break
-
-    with open("best_metrics.txt", "a") as f:
-        f.write("\nBest Validation Metrics\n")
-        f.write("=======================\n")
-        metric_str = " | ".join([f"{k}: {v}" for k, v in best_metrics.items()])
-        f.write(metric_str + "\n")
+    img1 = Draw.MolToImage(mol1, size=(224, 224))
+    img2 = Draw.MolToImage(mol2, size=(224, 224))
     
-    print(f"Best metrics saved to best_metrics.txt")
+    # 创建空白画布进行水平拼接
+    composite_img = Image.new('RGB', (448, 224))
+    composite_img.paste(img1, (0, 0))
+    composite_img.paste(img2, (224, 0))
+    
+    # 这里的 transform 就是你 dataloader 里的 default_transform
+    img_tensor = transform(composite_img).unsqueeze(0) 
+    return img_tensor
+
+def main():
+    args = parse_args()
+
+    # 1. 硬件绑定/解绑
+    if args.cpu_only:
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 2. Tissue 检索
+    tissue = args.tissue
+    if tissue is None:
+        try:
+            mapping_df = pd.read_csv("dataset/cell_tissue.csv")
+            cell_to_text_dict = dict(zip(mapping_df['cell_line'], mapping_df['tissue']))
+            tissue = cell_to_text_dict.get(args.cell_line)
+            if tissue is None:
+                raise ValueError(f"Tissue for '{args.cell_line}' not found.")
+        except FileNotFoundError:
+            raise FileNotFoundError("dataset/cell_tissue.csv not found.")
+
+    # 3. 准备文本 (完全对齐训练时的模板和截断设置)
+    tokenizer = AutoTokenizer.from_pretrained("dmis-lab/biobert-v1.1")
+    text_input = f"{args.cell_line} is a {tissue} cancer cell line."
+    
+    # 将字典形式的 inputs 直接转移到 device 上
+    inputs = tokenizer(
+        [text_input], # 注意这里需要传列表，模拟 batch_size=1
+        return_tensors="pt", 
+        truncation=True, 
+        padding=True, 
+        max_length=64
+    ).to(device)
+
+    # 4. 准备图像
+    image_tensor = generate_composite_image(args.smiles1, args.smiles2, default_transform).to(device)
+
+    # 5. 模型加载与参数解绑控制
+    model = MutiModelAF("dmis-lab/biobert-v1.1", config.num_classes).to(device)
+    state_dict = torch.load(args.model_path, map_location=device)
+    if hasattr(state_dict, 'state_dict'):
+        state_dict = state_dict.state_dict()
+        
+    strict_load = not args.unbind_weights
+    model.load_state_dict(state_dict, strict=strict_load)
+    model.eval()
+
+    # 6. 推理与概率计算
+    with torch.no_grad():
+        # 修正：直接传入 images 和 inputs 字典，与训练代码保持一致
+        outputs = model(image_tensor, inputs)
+        
+        # 因为训练代码用的是 CrossEntropyLoss，输出是 logits，所以用 softmax 计算概率
+        probs = torch.softmax(outputs, dim=1)
+        # 取类别 1 (协同) 的概率
+        prob_pos = probs[0][1].item()
+        
+    # 7. 阈值判定与格式化输出
+    threshold = 0.5
+    label = 1 if prob_pos >= threshold else 0
+
+    print("-" * 50)
+    print(f"SMILES 1 : {args.smiles1}")
+    print(f"SMILES 2 : {args.smiles2}")
+    print(f"Cell Line: {args.cell_line} ({tissue})")
+    print(f"Prob(+)  : {prob_pos:.6f}")
+    print(f"Label    : {label}  (threshold={threshold})")
+    print("-" * 50)
+
+if __name__ == "__main__":
+    main()
